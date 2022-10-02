@@ -72,7 +72,9 @@ DenseSet::DenseSet(pmr::memory_resource* mr) : entries_(mr) {
 }
 
 DenseSet::~DenseSet() {
-  ClearInternal();
+  // We can not call Clear from the base class because it internally calls ObjDelete which is
+  // a virtual function. Therefore, destructor of the derived classes must clean up the table.
+  CHECK(entries_.empty());
 }
 
 size_t DenseSet::PushFront(DenseSet::ChainVectorIterator it, void* data, bool has_ttl) {

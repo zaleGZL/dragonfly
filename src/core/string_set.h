@@ -1,3 +1,7 @@
+// Copyright 2022, DragonflyDB authors.  All rights reserved.
+// See LICENSE for licensing terms.
+//
+
 #pragma once
 
 #include <cstdint>
@@ -14,6 +18,12 @@ namespace dfly {
 
 class StringSet : public DenseSet {
  public:
+  StringSet(std::pmr::memory_resource* res = std::pmr::get_default_resource()) : DenseSet(res) {
+  }
+
+  ~StringSet();
+
+
   bool Add(std::string_view s1, uint32_t ttl_sec = UINT32_MAX);
 
   // Used currently by rdb_load.
@@ -26,14 +36,7 @@ class StringSet : public DenseSet {
   void Clear();
 
   std::optional<std::string> Pop();
-  sds PopRaw();
 
-  ~StringSet() {
-    Clear();
-  }
-
-  StringSet(std::pmr::memory_resource* res = std::pmr::get_default_resource()) : DenseSet(res) {
-  }
 
   iterator<sds> begin() {
     return DenseSet::begin<sds>();
