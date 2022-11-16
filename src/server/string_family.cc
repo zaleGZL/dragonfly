@@ -25,6 +25,8 @@ extern "C" {
 #include "server/transaction.h"
 #include "util/varz.h"
 
+bool crash_on_new = false;
+
 namespace dfly {
 
 namespace {
@@ -408,6 +410,10 @@ OpStatus SetCmd::Set(const SetParams& params, string_view key, string_view value
   PrimeIterator it = get<0>(add_res);
   if (!get<2>(add_res)) {  // Existing.
     return SetExisting(params, it, get<1>(add_res), key, value);
+  }
+
+  if (crash_on_new) {
+    LOG(FATAL) << "Crashing on " << key;
   }
 
   // Adding new value.
