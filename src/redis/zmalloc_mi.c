@@ -153,14 +153,21 @@ static inline mi_segment_t* _mi_ptr_segment(const void* p) {
 #define mi_likely(x) __builtin_expect(!!(x), true)
 
 // returns true if page is not active, and its used blocks <= capacity * ratio
+// MI_DEBUG is why mi_slice_t differs (keys field is not present in RELEASE)
 int zmalloc_page_is_underutilized(void* ptr, float ratio) {
   mi_segment_t* const segment = _mi_ptr_segment(ptr);
 
   // from _mi_segment_page_of
   ptrdiff_t diff = (uint8_t*)ptr - (uint8_t*)segment;
+  assert(diff < (ptrdiff_t)MI_SEGMENT_SIZE);
+
   size_t idx = (size_t)diff >> MI_SEGMENT_SLICE_SHIFT;
-  mi_slice_t* slice0 = (mi_slice_t*)&segment->slices[idx];
+  assert(idx < segment->slice_entries);
+
+  mi_slice_t* slice0 = &segment->slices[idx];
   mi_slice_t* slice = mi_slice_first(slice0);  // adjust to the block that holds the page data
+  assert(slice->slice_offset == 0);
+
   mi_page_t* page = (mi_page_t*)slice;
   // end from _mi_segment_page_of //
 

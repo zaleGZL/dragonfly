@@ -118,7 +118,8 @@ size_t zmalloc_usable_size(const void* p);
 void init_zmalloc_threadlocal(void* heap);
 extern __thread ssize_t zmalloc_used_memory_tl;
 
-// returns 1 if the page is underutilized and 0 otherwise.
+// returns 1 if the page is underutilized (i.e. utilization is below the specified ratio)
+// and 0 otherwise.
 int zmalloc_page_is_underutilized(void* ptr, float ratio);
 
 #undef __zm_str
