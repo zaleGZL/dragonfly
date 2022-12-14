@@ -23,6 +23,58 @@ namespace dfly {
 using namespace std;
 using absl::GetFlag;
 
+constexpr size_t kBlockLen = 4096;
+constexpr size_t kBlockAlignment = 4096;
+
+constexpr unsigned kSmallBinLen = 34;
+constexpr unsigned kMaxSmallBin = 2032;
+
+constexpr unsigned kSmallBins[kSmallBinLen] = {
+    72,  80,  88,  96,  104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184,  192,  200,
+    216, 232, 240, 264, 280, 304, 328, 360, 400, 440, 496, 576, 672, 808, 1008, 1352, 2032};
+
+constexpr unsigned SmallToBin(unsigned len) {
+  unsigned indx = (len + 7) / 8;
+  if (indx <= 9)
+    return 0;
+
+  indx -= 9;
+  if (indx < 18)
+    return indx;
+
+  unsigned rev_indx = (kBlockLen / len) - 1;
+  indx = kSmallBinLen - rev_indx;
+  if (kSmallBins[indx] < len)
+    ++indx;
+  return indx;
+}
+
+// Compile-time tests for SmallToBin.
+constexpr bool CheckBins() {
+  for (unsigned i = 64; i <= 2032; ++i) {
+    unsigned indx = SmallToBin(i);
+    if (kSmallBins[indx] < i)
+      return false;
+    if (indx > 0 && kSmallBins[indx - 1] > i)
+      return false;
+  }
+
+  for (unsigned j = 0; j < kSmallBinLen; ++j) {
+    if (SmallToBin(kSmallBins[j]) != j)
+      return false;
+  }
+  return true;
+}
+
+static_assert(CheckBins());
+static_assert(SmallToBin(kMaxSmallBin) == kSmallBinLen - 1);
+
+constexpr unsigned NumEntriesInSmallBin(unsigned bin_size) {
+  return (kBlockLen - 8) / (bin_size + 8);
+}
+
+static_assert(NumEntriesInSmallBin(72) == 51);
+
 string BackingFileName(string_view base, unsigned index) {
   return absl::StrCat(base, "-", absl::Dec(index, absl::kZeroPad4), ".ssd");
 }
@@ -60,8 +112,23 @@ struct EntryHash {
 };
 #endif
 
-const size_t kBatchSize = 4096;
-const size_t kPageAlignment = 4096;
+struct PrimeHasher {
+  size_t operator()(const PrimeKey& o) const {
+    return o.HashCode();
+  }
+};
+
+struct PendingState {
+  char todo;
+};
+
+struct TieredStorage::PerDb {
+  PerDb(const PerDb&) = delete;
+  PerDb& operator=(const PerDb&) = delete;
+  PerDb() = default;
+
+  absl::flat_hash_map<CompactObjectView, PendingState, PrimeHasher> pending_map[kSmallBinLen];
+};
 
 // we must support defragmentation of small entries.
 // This is similar to in-memory external defragmentation:
@@ -79,7 +146,7 @@ const size_t kPageAlignment = 4096;
 //   N*8 - hash values of the items
 //
 // To allow serializing dynamic number of entries we serialize them backwards
-// from the end of the page and this is why batch_offs_ starts from kBatchSize.
+// from the end of the page and this is why batch_offs_ starts from kBlockLen.
 // we will need maximum 1+56*8=449 bytes for the header.
 // constexpr size_t kMaxHeaderSize = 448;
 
@@ -88,9 +155,9 @@ class TieredStorage::ActiveIoRequest {
 
  public:
   explicit ActiveIoRequest(DbIndex db_index, size_t file_offs)
-      : db_index_(db_index), file_offset_(file_offs), batch_offs_(kBatchSize) {
-    block_ptr_ = (char*)mi_malloc_aligned(kBatchSize, kPageAlignment);
-    DCHECK_EQ(0u, intptr_t(block_ptr_) % kPageAlignment);
+      : db_index_(db_index), file_offset_(file_offs), batch_offs_(kBlockLen) {
+    block_ptr_ = (char*)mi_malloc_aligned(kBlockLen, kBlockAlignment);
+    DCHECK_EQ(0u, intptr_t(block_ptr_) % kBlockAlignment);
   }
 
   ~ActiveIoRequest() {
@@ -116,7 +183,7 @@ class TieredStorage::ActiveIoRequest {
   }
 
   size_t page_index() const {
-    return file_offset_ / kBatchSize;
+    return file_offset_ / kBlockLen;
   }
 
   DbIndex db_index() const {
@@ -124,7 +191,7 @@ class TieredStorage::ActiveIoRequest {
   }
 
   size_t serialized_len() const {
-    return kBatchSize - batch_offs_;
+    return kBlockLen - batch_offs_;
   }
 
  private:
@@ -171,7 +238,7 @@ void TieredStorage::ActiveIoRequest::WriteAsync(IoMgr* io_mgr, std::function<voi
     absl::little_endian::Store64(block_ptr_ + 1 + i * 8, hash_values_[i]);
   }
 
-  string_view sv{block_ptr_, kBatchSize};
+  string_view sv{block_ptr_, kBlockLen};
   io_mgr->WriteAsync(file_offset_, sv, move(cb));
 }
 
@@ -228,9 +295,9 @@ unsigned TieredStorage::ActiveIoRequest::ExternalizeEntries(DbSlice* db_slice) {
   return total_used;
 }
 
-bool TieredStorage::PerDb::ShouldFlush() const {
+/*bool TieredStorage::PerDb::ShouldFlush() const {
   return bucket_cursors.size() > bucket_cursors.capacity() / 2;
-}
+}*/
 
 TieredStorage::TieredStorage(DbSlice* db_slice) : db_slice_(*db_slice) {
 }
@@ -261,17 +328,17 @@ std::error_code TieredStorage::Read(size_t offset, size_t len, char* dest) {
 }
 
 void TieredStorage::Free(size_t offset, size_t len) {
-  if (offset % 4096 == 0) {
+  if (offset % kBlockLen == 0) {
     alloc_.Free(offset, len);
   } else {
-    size_t offs_page = offset / 4096;
+    size_t offs_page = offset / kBlockLen;
     auto it = multi_cnt_.find(offs_page);
     CHECK(it != multi_cnt_.end()) << offs_page;
     MultiBatch& mb = it->second;
     CHECK_GE(mb.used, len);
     mb.used -= len;
     if (mb.used == 0) {
-      alloc_.Free(offs_page * 4096, ExternalAllocator::kMinBlockSize);
+      alloc_.Free(offs_page * kBlockLen, ExternalAllocator::kMinBlockSize);
       VLOG(1) << "multi_cnt_ erase " << it->first;
       multi_cnt_.erase(it);
     }
@@ -337,9 +404,10 @@ error_code TieredStorage::UnloadItem(DbIndex db_index, PrimeIterator it) {
   // Relevant only for OBJ_STRING, see CHECK above.
   size_t blob_len = it->second.Size();
 
-  if (blob_len >= kBatchSize / 2 &&
-      num_active_requests_ < GetFlag(FLAGS_tiered_storage_max_pending_writes)) {
-    WriteSingle(db_index, it, blob_len);
+  if (blob_len > kMaxSmallBin) {
+    if (num_active_requests_ < GetFlag(FLAGS_tiered_storage_max_pending_writes)) {
+      WriteSingle(db_index, it, blob_len);
+    }  // otherwise skip
     return error_code{};
   }
 
@@ -352,19 +420,33 @@ error_code TieredStorage::UnloadItem(DbIndex db_index, PrimeIterator it) {
   }
 
   PerDb* db = db_arr_[db_index];
-  db->bucket_cursors.EmplaceOrOverride(it.bucket_cursor().value());
-  // db->pending_upload[it.bucket_cursor().value()] += blob_len;
 
-  // size_t grow_size = 0;
-  if (db->ShouldFlush()) {
-    if (num_active_requests_ < GetFlag(FLAGS_tiered_storage_max_pending_writes)) {
-      FlushPending(db_index);
+  unsigned bin_index = SmallToBin(blob_len);
 
-      // if we reached high utilization of the file range - try to grow the file.
-      if (alloc_.allocated_bytes() > size_t(alloc_.capacity() * 0.85)) {
-        InitiateGrow(1ULL << 28);
-      }
+  DCHECK_LT(bin_index, kSmallBinLen);
+
+  unsigned max_entries = NumEntriesInSmallBin(kSmallBins[bin_index]);
+  auto& pending_map = db->pending_map[bin_index];
+
+  // TODO: we need to track all the cases where we omit offloading attempt.
+  if (pending_map.size() >= max_entries)
+    return error_code{};
+
+  pending_map[it->first].todo = 1;
+
+  if (pending_map.size() < max_entries)
+    return error_code{};
+
+  if (num_active_requests_ < GetFlag(FLAGS_tiered_storage_max_pending_writes)) {
+    FlushPending(db_index, bin_index);
+
+    // if we reached high utilization of the file range - try to grow the file.
+    if (alloc_.allocated_bytes() > size_t(alloc_.capacity() * 0.85)) {
+      InitiateGrow(1ULL << 28);
     }
+  } else {
+    // we could not flush because I/O is saturated, so lets remove the last item.
+    pending_map.erase(it->first.AsRef());
   }
 
   return error_code{};
@@ -383,11 +465,11 @@ void TieredStorage::WriteSingle(DbIndex db_index, PrimeIterator it, size_t blob_
     return;
   }
 
-  constexpr size_t kMask = kPageAlignment - 1;
+  constexpr size_t kMask = kBlockAlignment - 1;
   size_t page_size = (blob_len + kMask) & (~kMask);
 
   DCHECK_GE(page_size, blob_len);
-  DCHECK_EQ(0u, page_size % kPageAlignment);
+  DCHECK_EQ(0u, page_size % kBlockAlignment);
 
   struct SingleRequest {
     char* block_ptr = nullptr;
@@ -397,7 +479,7 @@ void TieredStorage::WriteSingle(DbIndex db_index, PrimeIterator it, size_t blob_
     string key;
   } req;
 
-  char* block_ptr = (char*)mi_malloc_aligned(page_size, kPageAlignment);
+  char* block_ptr = (char*)mi_malloc_aligned(page_size, kBlockAlignment);
 
   req.blob_len = blob_len;
   req.offset = res;
@@ -428,11 +510,16 @@ void TieredStorage::WriteSingle(DbIndex db_index, PrimeIterator it, size_t blob_
   io_mgr_.WriteAsync(res, string_view{block_ptr, page_size}, std::move(cb));
 }
 
-void TieredStorage::FlushPending(DbIndex db_index) {
+void TieredStorage::FlushPending(DbIndex db_index, unsigned bin_index) {
   PerDb* db = db_arr_[db_index];
 
-  DCHECK(!io_mgr_.grow_pending() && !db->bucket_cursors.empty());
+  DCHECK(!io_mgr_.grow_pending());
 
+  int64_t res = alloc_.Malloc(kBlockLen);
+  // TODO: to handle this case.
+  CHECK_GE(res, 0);
+
+#if 0
   vector<uint64_t> canonic_req;
   canonic_req.reserve(db->bucket_cursors.size());
 
@@ -477,7 +564,7 @@ void TieredStorage::FlushPending(DbIndex db_index) {
         if (active_req) {  // need to close
           // save the block asynchronously.
           ++submitted_io_writes_;
-          submitted_io_write_size_ += kBatchSize;
+          submitted_io_write_size_ += kBlockLen;
 
           SendIoRequest(active_req);
           active_req = nullptr;
@@ -503,7 +590,7 @@ void TieredStorage::FlushPending(DbIndex db_index) {
 
   // flush or undo the pending request.
   if (active_req) {
-    if (active_req->serialized_len() >= kBatchSize / 2) {
+    if (active_req->serialized_len() >= kBlockLen / 2) {
       SendIoRequest(active_req);
     } else {
       // data is too small. rollback active_req.
@@ -512,6 +599,7 @@ void TieredStorage::FlushPending(DbIndex db_index) {
       delete active_req;
     }
   }
+#endif
 }
 
 void TieredStorage::InitiateGrow(size_t grow_size) {

@@ -372,4 +372,33 @@ inline bool CompactObj::operator==(std::string_view sv) const {
   return EqualNonInline(sv);
 }
 
+class CompactObjectView {
+ public:
+  CompactObjectView(const CompactObj& src) : obj_(src.AsRef()) {
+  }
+  CompactObjectView(const CompactObjectView& o) : obj_(o.obj_.AsRef()) {
+  }
+  CompactObjectView(CompactObjectView&& o) = default;
+
+  operator CompactObj() const {
+    return obj_.AsRef();
+  }
+
+  bool operator==(const CompactObjectView& o) const {
+    return obj_ == o.obj_;
+  }
+
+  uint64_t Hash() const {
+    return obj_.HashCode();
+  }
+
+  CompactObjectView& operator=(const CompactObjectView& o) {
+    obj_ = o.obj_.AsRef();
+    return *this;
+  }
+
+ private:
+  CompactObj obj_;
+};
+
 }  // namespace dfly
